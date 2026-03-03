@@ -68,12 +68,12 @@ def load_games_sportsdataverse(season: int, save: bool = True) -> pd.DataFrame:
         print(f"  WARNING: Error pulling {season}: {e}")
         return pd.DataFrame()
     
-    if schedule is None or schedule.empty:
+    if schedule is None or len(schedule) == 0:
         print(f"  WARNING: No data returned for {season}")
         return pd.DataFrame()
 
     # Standardize column names - sportsdataverse schema can vary
-    df = schedule.copy()
+    df = schedule.to_pandas()
     
     # Map to our standard schema
     rename_map = {
@@ -467,4 +467,4 @@ if __name__ == "__main__":
     if args.full:
         build_master_dataset(args.start, args.end)
     else:
-        load_all_games(args.start, args.end, source=args.source)
+        load_all_games(args.start, args.end, source=args

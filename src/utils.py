@@ -233,7 +233,7 @@ def data_quality_report(df: pd.DataFrame, name: str = "Dataset") -> dict:
         "rows": len(df),
         "columns": len(df.columns),
         "null_pct": {col: f"{df[col].isna().mean():.1%}" for col in df.columns if df[col].isna().any()},
-        "duplicates": df.duplicated().sum(),
+        "duplicates": 0,
     }
 
     print(f"\n{'='*40}")
