@@ -1,0 +1,29 @@
+# Data
+data/raw/
+data/processed/
+data/odds/
+*.csv
+*.parquet
+
+# Models
+models/*.pkl
+models/*.joblib
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
