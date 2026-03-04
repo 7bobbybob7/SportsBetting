@@ -467,4 +467,4 @@ if __name__ == "__main__":
     if args.full:
         build_master_dataset(args.start, args.end)
     else:
-        load_all_games(args.start, args.end, source=args
+        load_all_games(args.start, args.end, source=args.source)
