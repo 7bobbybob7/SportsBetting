@@ -39,7 +39,8 @@ TRAIN_SEASONS = list(range(2018, 2024))   # 2017-18 through 2022-23
 VAL_SEASONS = [2024]                       # 2023-24
 TEST_SEASONS = [2025]                      # 2024-25 regular season
 
-ROLLING_WINDOW = 12  # games to average for rolling stats
+ROLLING_WINDOW = 10   # recent form window
+SEASON_WINDOW = 100   # effectively full season
 
 DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
@@ -74,7 +75,7 @@ def step_data():
 def step_rolling():
     """Step 2: Compute rolling efficiency metrics from box scores."""
     print("\n" + "=" * 60)
-    print("STEP 2: ROLLING STATS (window={})".format(ROLLING_WINDOW))
+    print("STEP 2: ROLLING STATS (short={}, season={})".format(ROLLING_WINDOW, SEASON_WINDOW))
     print("=" * 60)
 
     games = pd.read_csv(PROCESSED_DIR / "all_games.csv")
@@ -85,12 +86,29 @@ def step_rolling():
     game_stats = compute_game_stats(boxscores)
     game_stats.to_csv(PROCESSED_DIR / "game_stats.csv", index=False)
 
-    # Rolling features
-    print("Computing rolling features...")
-    rolling = compute_rolling_features(games, game_stats, window=ROLLING_WINDOW)
-    rolling.to_csv(PROCESSED_DIR / "rolling_features.csv", index=False)
+    # Short window (recent form)
+    print("\nComputing short rolling features (window={})...".format(ROLLING_WINDOW))
+    short = compute_rolling_features(games, game_stats, window=ROLLING_WINDOW)
+    short.to_csv(PROCESSED_DIR / "rolling_features.csv", index=False)
 
-    return rolling
+    # Full season window
+    print("\nComputing season rolling features (window={})...".format(SEASON_WINDOW))
+    full = compute_rolling_features(games, game_stats, window=SEASON_WINDOW)
+
+    # Rename full season columns: roll_ -> season_
+    full_cols = [c for c in full.columns if c.startswith(("home_roll_", "away_roll_", "roll_"))]
+    full_rename = {c: c.replace("roll_", "season_") for c in full_cols}
+    full = full.rename(columns=full_rename)
+
+    # Merge season stats onto short window
+    season_cols = [c for c in full.columns if "season_" in c] + ["game_id"]
+    short["game_id"] = short["game_id"].astype(str)
+    full["game_id"] = full["game_id"].astype(str)
+    combined = short.merge(full[season_cols], on="game_id", how="left")
+
+    combined.to_csv(PROCESSED_DIR / "rolling_features_combined.csv", index=False)
+
+    return combined
 
 
 def step_elo(games, tune=False):
@@ -146,7 +164,16 @@ def step_features():
 
     # Load components
     elo_log = pd.read_csv(PROCESSED_DIR / "elo_game_log.csv")
-    rolling = pd.read_csv(PROCESSED_DIR / "rolling_features.csv")
+
+    # Use combined rolling if available, else short-only
+    combined_path = PROCESSED_DIR / "rolling_features_combined.csv"
+    short_path = PROCESSED_DIR / "rolling_features.csv"
+    if combined_path.exists():
+        rolling = pd.read_csv(combined_path)
+        print("Using combined rolling features (short + season)")
+    else:
+        rolling = pd.read_csv(short_path)
+        print("Using short-only rolling features")
 
     # Merge ELO onto rolling features
     elo_cols = [
@@ -158,7 +185,6 @@ def step_features():
 
     features = rolling.merge(elo_log[elo_cols], on="game_id", how="left", suffixes=("", "_elo"))
 
-    # Use season from rolling (same data, just avoid duplicates)
     if "season_elo" in features.columns:
         features = features.drop(columns=["season_elo"])
 
@@ -167,20 +193,27 @@ def step_features():
     features["elo_sum"] = features["home_elo_pre"] + features["away_elo_pre"]
     features["is_neutral"] = features["neutral"].astype(int)
 
+    # Rest days and season progress
+    features = _add_rest_and_progress(features)
+
     # Define feature columns
     elo_features = ["elo_diff", "elo_sum", "is_neutral", "home_elo_pre", "away_elo_pre"]
     roll_diffs = [c for c in features.columns if c.startswith("roll_") and c.endswith("_diff")]
-    feature_cols = elo_features + roll_diffs
+    season_diffs = [c for c in features.columns if c.startswith("season_") and c.endswith("_diff")]
+    context_feats = ["rest_diff", "home_rest_days", "away_rest_days", "season_progress"]
+    context_avail = [c for c in context_feats if c in features.columns]
+
+    feature_cols = elo_features + roll_diffs + season_diffs + context_avail
 
     print("Features: {}".format(len(feature_cols)))
-    for f in feature_cols:
-        avail = features[f].notna().mean()
-        print("  {}: {:.1f}%".format(f, 100 * avail))
+    print("  ELO: {}".format(len(elo_features)))
+    print("  Rolling diffs: {}".format(len(roll_diffs)))
+    print("  Season diffs: {}".format(len(season_diffs)))
+    print("  Context: {}".format(len(context_avail)))
 
     # Save
     features.to_csv(PROCESSED_DIR / "features_v2.csv", index=False)
 
-    # Also save feature column list
     with open(PROCESSED_DIR / "feature_cols.txt", "w") as fh:
         for c in feature_cols:
             fh.write(c + "\n")
@@ -188,6 +221,65 @@ def step_features():
     data_quality_report(features, "Feature Matrix v2")
 
     return features, feature_cols
+
+
+def _add_rest_and_progress(features):
+    """Add rest days and season progress features."""
+    import numpy as np
+
+    features = features.copy()
+    features["date_dt"] = pd.to_datetime(features["date"], errors="coerce")
+    features = features.sort_values("date_dt").reset_index(drop=True)
+
+    last_game = {}
+    rest_home = []
+    rest_away = []
+
+    for _, row in features.iterrows():
+        home = row["home_team"]
+        away = row["away_team"]
+        date = row["date_dt"]
+
+        if pd.isna(date):
+            rest_home.append(np.nan)
+            rest_away.append(np.nan)
+            continue
+
+        if home in last_game and pd.notna(last_game[home]):
+            rest_h = (date - last_game[home]).days
+        else:
+            rest_h = 7
+
+        if away in last_game and pd.notna(last_game[away]):
+            rest_a = (date - last_game[away]).days
+        else:
+            rest_a = 7
+
+        rest_home.append(rest_h)
+        rest_away.append(rest_a)
+        last_game[home] = date
+        last_game[away] = date
+
+    features["home_rest_days"] = rest_home
+    features["away_rest_days"] = rest_away
+    features["rest_diff"] = features["home_rest_days"] - features["away_rest_days"]
+
+    # Season progress
+    for season in features["season"].unique():
+        mask = features["season"] == season
+        dates = features.loc[mask, "date_dt"]
+        if dates.isna().all():
+            continue
+        min_d = dates.min()
+        max_d = dates.max()
+        rng = (max_d - min_d).days
+        if rng > 0:
+            features.loc[mask, "season_progress"] = (dates - min_d).dt.days / rng
+        else:
+            features.loc[mask, "season_progress"] = 0.5
+
+    features = features.drop(columns=["date_dt"], errors="ignore")
+    return features
 
 
 def step_train(features=None, feature_cols=None):
