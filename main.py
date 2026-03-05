@@ -1,13 +1,23 @@
 """
 main.py - End-to-end pipeline for the CBB betting model.
 
+Pipeline:
+    1. Load game data + box scores (already pulled)
+    2. Compute rolling efficiency metrics from box scores (no leakage)
+    3. Build ELO ratings
+    4. Merge ELO + rolling stats into feature matrix
+    5. Train logistic regression + XGBoost
+    6. Backtest with Kelly criterion
+    7. Save models and results
+
 Usage:
     python main.py                    # Full pipeline
     python main.py --step data        # Verify data exists
-    python main.py --step elo         # Just run ELO
-    python main.py --step features    # Just build features
-    python main.py --step train       # Just train models
-    python main.py --step backtest    # Just run backtest
+    python main.py --step rolling     # Compute rolling stats
+    python main.py --step elo         # Build ELO ratings
+    python main.py --step features    # Merge ELO + rolling into features
+    python main.py --step train       # Train models
+    python main.py --step backtest    # Run backtest
 """
 
 import argparse
@@ -16,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.elo import EloRater, tune_elo
-from src.feature_engineering import build_features, get_feature_columns
+from src.rolling_stats import compute_game_stats, compute_rolling_features
 from src.models import train_all_models, save_model
 from src.backtester import Backtester
 from src.utils import data_quality_report
@@ -29,45 +39,64 @@ TRAIN_SEASONS = list(range(2018, 2024))   # 2017-18 through 2022-23
 VAL_SEASONS = [2024]                       # 2023-24
 TEST_SEASONS = [2025]                      # 2024-25 regular season
 
+ROLLING_WINDOW = 12  # games to average for rolling stats
+
 DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
+PROCESSED_DIR = DATA_DIR / "processed"
 
 
 def step_data():
-    """Step 1: Load pre-pulled data and verify it."""
+    """Step 1: Verify all required data exists."""
     print("\n" + "=" * 60)
-    print("STEP 1: DATA LOADING")
+    print("STEP 1: DATA VERIFICATION")
     print("=" * 60)
 
-    # Game results (from ESPN API via pull_data_v2.py)
-    games_path = DATA_DIR / "processed" / "all_games.csv"
+    games_path = PROCESSED_DIR / "all_games.csv"
     if not games_path.exists():
-        print("ERROR: {} not found.".format(games_path))
-        print("Run pull_data_v2.py first to pull game data.")
-        return None, None
+        print("ERROR: {} not found. Run pull_data_v2.py first.".format(games_path))
+        return None
 
     games = pd.read_csv(games_path)
-    print("Loaded {} games from {}".format(len(games), games_path))
-    data_quality_report(games, "Game Data")
+    print("Games: {} rows".format(len(games)))
 
-    # Barttorvik ratings (manually downloaded CSVs)
-    bart_path = DATA_DIR / "processed" / "barttorvik_all.csv"
-    if not bart_path.exists():
-        print("WARNING: {} not found.".format(bart_path))
-        print("Barttorvik data not available - will use ELO-only features.")
-        barttorvik = None
-    else:
-        barttorvik = pd.read_csv(bart_path)
-        print("Loaded {} team-seasons from {}".format(len(barttorvik), bart_path))
-        data_quality_report(barttorvik, "Barttorvik Ratings")
+    boxscores_path = PROCESSED_DIR / "boxscores_flat.csv"
+    if not boxscores_path.exists():
+        print("ERROR: {} not found. Run pull_boxscores.py first.".format(boxscores_path))
+        return None
 
-    return games, barttorvik
+    boxscores = pd.read_csv(boxscores_path)
+    print("Box scores: {} rows".format(len(boxscores)))
+
+    return games
+
+
+def step_rolling():
+    """Step 2: Compute rolling efficiency metrics from box scores."""
+    print("\n" + "=" * 60)
+    print("STEP 2: ROLLING STATS (window={})".format(ROLLING_WINDOW))
+    print("=" * 60)
+
+    games = pd.read_csv(PROCESSED_DIR / "all_games.csv")
+    boxscores = pd.read_csv(PROCESSED_DIR / "boxscores_flat.csv")
+
+    # Per-game stats
+    print("Computing per-game stats...")
+    game_stats = compute_game_stats(boxscores)
+    game_stats.to_csv(PROCESSED_DIR / "game_stats.csv", index=False)
+
+    # Rolling features
+    print("Computing rolling features...")
+    rolling = compute_rolling_features(games, game_stats, window=ROLLING_WINDOW)
+    rolling.to_csv(PROCESSED_DIR / "rolling_features.csv", index=False)
+
+    return rolling
 
 
 def step_elo(games, tune=False):
-    """Step 2: Build ELO ratings."""
+    """Step 3: Build ELO ratings."""
     print("\n" + "=" * 60)
-    print("STEP 2: ELO RATINGS")
+    print("STEP 3: ELO RATINGS")
     print("=" * 60)
 
     if tune:
@@ -89,7 +118,6 @@ def step_elo(games, tune=False):
             mov_cap=25,
         )
 
-    # Rate all seasons
     game_log = elo.rate_seasons(games, start_year=2018, end_year=2025)
 
     # Evaluate
@@ -99,42 +127,80 @@ def step_elo(games, tune=False):
         if k != "calibration":
             print("  {}: {}".format(k, v))
 
-    print("\nELO Evaluation (by season):")
-    by_season = elo.evaluate_by_season()
-    print(by_season.to_string())
-
-    # Top 25
     print("\nCurrent Top 25:")
     print(elo.get_ratings(top_n=25).to_string())
 
     # Save
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     elo.save(str(MODELS_DIR / "elo_ratings.json"))
-    game_log.to_csv(DATA_DIR / "processed" / "elo_game_log.csv", index=False)
+    game_log.to_csv(PROCESSED_DIR / "elo_game_log.csv", index=False)
 
     return elo, game_log
 
 
-def step_features(game_log, barttorvik):
-    """Step 3: Engineer features."""
+def step_features():
+    """Step 4: Merge ELO + rolling stats into final feature matrix."""
     print("\n" + "=" * 60)
-    print("STEP 3: FEATURE ENGINEERING")
+    print("STEP 4: FEATURE ENGINEERING")
     print("=" * 60)
 
-    features = build_features(game_log, game_log, barttorvik)
-    feature_cols = get_feature_columns(features)
+    # Load components
+    elo_log = pd.read_csv(PROCESSED_DIR / "elo_game_log.csv")
+    rolling = pd.read_csv(PROCESSED_DIR / "rolling_features.csv")
 
-    features.to_csv(DATA_DIR / "processed" / "features.csv", index=False)
-    data_quality_report(features, "Feature Matrix")
+    # Merge ELO onto rolling features
+    elo_cols = [
+        "game_id", "home_elo_pre", "away_elo_pre", "home_elo_adj",
+        "home_win_prob", "home_win", "neutral", "season",
+    ]
+    elo_log["game_id"] = elo_log["game_id"].astype(str)
+    rolling["game_id"] = rolling["game_id"].astype(str)
+
+    features = rolling.merge(elo_log[elo_cols], on="game_id", how="left", suffixes=("", "_elo"))
+
+    # Use season from rolling (same data, just avoid duplicates)
+    if "season_elo" in features.columns:
+        features = features.drop(columns=["season_elo"])
+
+    # ELO features
+    features["elo_diff"] = features["home_elo_adj"] - features["away_elo_pre"]
+    features["elo_sum"] = features["home_elo_pre"] + features["away_elo_pre"]
+    features["is_neutral"] = features["neutral"].astype(int)
+
+    # Define feature columns
+    elo_features = ["elo_diff", "elo_sum", "is_neutral", "home_elo_pre", "away_elo_pre"]
+    roll_diffs = [c for c in features.columns if c.startswith("roll_") and c.endswith("_diff")]
+    feature_cols = elo_features + roll_diffs
+
+    print("Features: {}".format(len(feature_cols)))
+    for f in feature_cols:
+        avail = features[f].notna().mean()
+        print("  {}: {:.1f}%".format(f, 100 * avail))
+
+    # Save
+    features.to_csv(PROCESSED_DIR / "features_v2.csv", index=False)
+
+    # Also save feature column list
+    with open(PROCESSED_DIR / "feature_cols.txt", "w") as fh:
+        for c in feature_cols:
+            fh.write(c + "\n")
+
+    data_quality_report(features, "Feature Matrix v2")
 
     return features, feature_cols
 
 
-def step_train(features, feature_cols):
-    """Step 4: Train models."""
+def step_train(features=None, feature_cols=None):
+    """Step 5: Train models."""
     print("\n" + "=" * 60)
-    print("STEP 4: MODEL TRAINING")
+    print("STEP 5: MODEL TRAINING")
     print("=" * 60)
+
+    if features is None:
+        features = pd.read_csv(PROCESSED_DIR / "features_v2.csv")
+    if feature_cols is None:
+        with open(PROCESSED_DIR / "feature_cols.txt") as fh:
+            feature_cols = [line.strip() for line in fh if line.strip()]
 
     results = train_all_models(
         features,
@@ -152,11 +218,14 @@ def step_train(features, feature_cols):
     return results
 
 
-def step_backtest(features, model_results):
-    """Step 5: Backtest with Kelly criterion."""
+def step_backtest(features=None, model_results=None, feature_cols=None):
+    """Step 6: Backtest with Kelly criterion."""
     print("\n" + "=" * 60)
-    print("STEP 5: BACKTESTING")
+    print("STEP 6: BACKTESTING")
     print("=" * 60)
+
+    if features is None:
+        features = pd.read_csv(PROCESSED_DIR / "features_v2.csv")
 
     test_data = features[features["season"].isin(TEST_SEASONS)].copy()
 
@@ -168,6 +237,10 @@ def step_backtest(features, model_results):
         print("WARNING: No market probabilities. Using ELO win prob as proxy.")
         test_data["market_prob"] = test_data["home_win_prob"]
 
+    if model_results is None:
+        print("WARNING: No model results passed. Skipping.")
+        return
+
     for model_name in ["logistic_regression", "xgboost"]:
         if model_name not in model_results:
             continue
@@ -177,9 +250,9 @@ def step_backtest(features, model_results):
         model_dict = model_results[model_name]["model"]
         model = model_dict["model"]
         scaler = model_dict.get("scaler")
-        feature_cols = model_dict["feature_cols"]
+        feat_cols = model_dict["feature_cols"]
 
-        X_test = test_data[feature_cols].copy()
+        X_test = test_data[feat_cols].copy()
         mask = X_test.notna().all(axis=1)
         X_clean = X_test[mask]
 
@@ -207,48 +280,45 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--step",
-        choices=["data", "elo", "features", "train", "backtest", "all"],
+        choices=["data", "rolling", "elo", "features", "train", "backtest", "all"],
         default="all",
     )
     parser.add_argument("--tune-elo", action="store_true")
     args = parser.parse_args()
 
     print("=" * 50)
-    print("  CBB BETTING MODEL PIPELINE")
+    print("  CBB BETTING MODEL PIPELINE v2")
     print("  March Madness 2026 Edition")
+    print("  Rolling Stats (no leakage)")
     print("=" * 50)
 
     if args.step in ("data", "all"):
-        games, barttorvik = step_data()
+        games = step_data()
         if games is None:
             return
 
+    if args.step in ("rolling", "all"):
+        rolling = step_rolling()
+
     if args.step in ("elo", "all"):
-        if args.step == "elo":
-            games = pd.read_csv(DATA_DIR / "processed" / "all_games.csv")
-            barttorvik_path = DATA_DIR / "processed" / "barttorvik_all.csv"
-            barttorvik = pd.read_csv(barttorvik_path) if barttorvik_path.exists() else None
+        games = pd.read_csv(PROCESSED_DIR / "all_games.csv")
         elo, game_log = step_elo(games, tune=args.tune_elo)
 
     if args.step in ("features", "all"):
-        if args.step == "features":
-            game_log = pd.read_csv(DATA_DIR / "processed" / "elo_game_log.csv")
-            barttorvik_path = DATA_DIR / "processed" / "barttorvik_all.csv"
-            barttorvik = pd.read_csv(barttorvik_path) if barttorvik_path.exists() else None
-        features, feature_cols = step_features(game_log, barttorvik)
+        features, feature_cols = step_features()
 
     if args.step in ("train", "all"):
         if args.step == "train":
-            features = pd.read_csv(DATA_DIR / "processed" / "features.csv")
-            feature_cols = get_feature_columns(features)
+            features = None
+            feature_cols = None
         model_results = step_train(features, feature_cols)
 
     if args.step in ("backtest", "all"):
         if args.step == "backtest":
-            features = pd.read_csv(DATA_DIR / "processed" / "features.csv")
-            feature_cols = get_feature_columns(features)
-            model_results = {}
-        step_backtest(features, model_results)
+            features = pd.read_csv(PROCESSED_DIR / "features_v2.csv")
+            model_results = None
+            feature_cols = None
+        step_backtest(features, model_results, feature_cols)
 
     print("\nPipeline complete!")
 
