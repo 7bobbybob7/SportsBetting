@@ -214,11 +214,20 @@ def compute_rolling_features(
     # Process games chronologically
     home_rolling = []
     away_rolling = []
+    current_season = None
 
     print("Computing rolling stats (window={})...".format(window))
 
     for idx, game in games.iterrows():
         gid = str(game["game_id"])
+
+        # Reset team history at the start of each new season
+        game_season = game.get("season", None)
+        if game_season != current_season:
+            team_history = {}
+            current_season = game_season
+            print("  Season {} — reset rolling stats".format(current_season))
+
         home_id = str(game.get("home_id", ""))
         away_id = str(game.get("away_id", ""))
 

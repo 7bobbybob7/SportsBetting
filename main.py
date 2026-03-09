@@ -136,7 +136,7 @@ def step_elo(games, tune=False):
             mov_cap=25,
         )
 
-    game_log = elo.rate_seasons(games, start_year=2018, end_year=2025)
+    game_log = elo.rate_seasons(games, start_year=2018, end_year=int(games["season"].max()))
 
     # Evaluate
     print("\nELO Evaluation (all seasons):")
