@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import joblib
 from pathlib import Path
 
 import pandas as pd
@@ -325,28 +326,49 @@ def step_backtest(features=None, model_results=None, feature_cols=None):
         print("WARNING: No test data available for backtesting")
         return
 
-    if "market_prob" not in test_data.columns:
-        print("WARNING: No market probabilities. Using ELO win prob as proxy.")
-        test_data["market_prob"] = test_data["home_win_prob"]
+    # Fix column name: our odds puller saves market_prob_home
+    if "market_prob_home" in test_data.columns and "market_prob" not in test_data.columns:
+        test_data["market_prob"] = test_data["market_prob_home"]
 
-    if model_results is None:
-        print("WARNING: No model results passed. Skipping.")
+    if "market_prob" not in test_data.columns or test_data["market_prob"].isna().all():
+        print("WARNING: No market probabilities. Run pull_odds.py first.")
         return
 
-    for model_name in ["logistic_regression", "xgboost"]:
-        if model_name not in model_results:
-            continue
+    # Load models from disk if not passed in
+    model_names = ["logistic_regression", "xgboost"]
+    models_to_test = {}
 
+    if model_results is not None:
+        for name in model_names:
+            if name in model_results:
+                models_to_test[name] = model_results[name]["model"]
+    else:
+        for name in model_names:
+            path = MODELS_DIR / "{}.joblib".format(name)
+            if path.exists():
+                models_to_test[name] = joblib.load(path)
+                print("Loaded {} from disk".format(name))
+
+    if not models_to_test:
+        print("WARNING: No models found. Run --step train first.")
+        return
+
+    for model_name, model_dict in models_to_test.items():
         print("\n--- Backtesting {} ---".format(model_name))
 
-        model_dict = model_results[model_name]["model"]
         model = model_dict["model"]
         scaler = model_dict.get("scaler")
         feat_cols = model_dict["feature_cols"]
 
-        X_test = test_data[feat_cols].copy()
+        # Filter to rows with both features and market odds
+        test_with_odds = test_data.dropna(subset=["market_prob"])
+        X_test = test_with_odds[feat_cols].copy()
         mask = X_test.notna().all(axis=1)
         X_clean = X_test[mask]
+
+        if len(X_clean) == 0:
+            print("No valid rows for backtesting")
+            continue
 
         if scaler:
             X_input = scaler.transform(X_clean)
@@ -355,15 +377,17 @@ def step_backtest(features=None, model_results=None, feature_cols=None):
 
         model_probs = model.predict_proba(X_input)[:, 1]
 
-        test_clean = test_data[mask].copy()
+        test_clean = test_with_odds[mask].copy()
         test_clean["model_prob"] = model_probs
+
+        print("Games with odds: {}".format(len(test_clean)))
 
         bt = Backtester(
             bankroll=10_000,
             kelly_fraction=0.25,
             min_edge=0.03,
         )
-        bt.run(test_clean)
+        bt.run(test_clean, model_prob_col="model_prob", market_prob_col="market_prob")
         bt.summary()
 
 
