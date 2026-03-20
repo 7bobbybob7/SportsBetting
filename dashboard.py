@@ -144,7 +144,13 @@ BETS_FILE = Path("data/bets_log.csv")
 def load_bets():
     """Load existing bets log."""
     if BETS_FILE.exists():
-        return pd.read_csv(BETS_FILE)
+        try:
+            df = pd.read_csv(BETS_FILE)
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception:
+            return pd.DataFrame()
     return pd.DataFrame()
 
 
@@ -186,36 +192,59 @@ def remove_bet(game_id, bet_side):
 
 
 def settle_bets():
-    """Check completed games and calculate P&L."""
+    """Check completed games and calculate P&L using ESPN API."""
     df = load_bets()
     if df.empty:
         return df
 
-    features = load_features()
-    features["game_id"] = features["game_id"].astype(str)
-
     for idx, row in df.iterrows():
         if pd.notna(row.get("profit")):
-            continue
+            continue  # already settled
+
         gid = str(row["game_id"])
-        game = features[features["game_id"] == gid]
-        if game.empty:
+
+        # Hit ESPN summary for this game
+        try:
+            resp = requests.get(
+                "https://site.api.espn.com/apis/site/v2/sports/basketball/"
+                "mens-college-basketball/summary?event={}".format(gid),
+                timeout=10,
+            )
+            data = resp.json()
+            header = data.get("header", {})
+            competitions = header.get("competitions", [{}])
+            if not competitions:
+                continue
+            comp = competitions[0]
+
+            # Check if game is complete
+            status = comp.get("status", {}).get("type", {})
+            if not status.get("completed", False):
+                continue
+
+            # Get scores
+            competitors = comp.get("competitors", [])
+            home_score = away_score = 0
+            for c in competitors:
+                if c.get("homeAway") == "home":
+                    home_score = int(c.get("score", 0))
+                else:
+                    away_score = int(c.get("score", 0))
+
+            home_won = home_score > away_score
+            bet_won = (row["bet_side"] == "home" and home_won) or \
+                      (row["bet_side"] == "away" and not home_won)
+
+            if bet_won:
+                profit = row["bet_amount"] * (row["decimal_odds"] - 1)
+            else:
+                profit = -row["bet_amount"]
+
+            df.at[idx, "result"] = "W" if bet_won else "L"
+            df.at[idx, "profit"] = round(profit, 2)
+
+        except Exception:
             continue
-        game = game.iloc[0]
-        if pd.isna(game.get("home_score")) or pd.isna(game.get("away_score")):
-            continue
-
-        home_won = int(game["home_score"]) > int(game["away_score"])
-        bet_won = (row["bet_side"] == "home" and home_won) or \
-                  (row["bet_side"] == "away" and not home_won)
-
-        if bet_won:
-            profit = row["bet_amount"] * (row["decimal_odds"] - 1)
-        else:
-            profit = -row["bet_amount"]
-
-        df.at[idx, "result"] = "W" if bet_won else "L"
-        df.at[idx, "profit"] = round(profit, 2)
 
     df.to_csv(BETS_FILE, index=False)
     return df
@@ -436,7 +465,45 @@ def main():
 
     # Edge threshold
     min_edge = st.sidebar.slider("Minimum Edge (%)", 0, 15, 3, 1) / 100
-    bankroll = st.sidebar.number_input("Bankroll ($)", value=10000, step=500, min_value=100)
+    # Bankroll management (persistent)
+    CONFIG_FILE = Path("data/config.json")
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE) as f:
+            config = json.load(f)
+    else:
+        config = {"total_deposited": 0}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+
+    # Calculate current bankroll from deposits + P&L - pending bets
+    bets_for_bankroll = load_bets()
+    settled_profit = 0
+    pending_count = 0
+    pending_amount = 0
+    if not bets_for_bankroll.empty and "profit" in bets_for_bankroll.columns:
+        settled_profit = bets_for_bankroll["profit"].dropna().sum()
+        pending_count = bets_for_bankroll["profit"].isna().sum()
+        pending_bets = bets_for_bankroll[bets_for_bankroll["profit"].isna()]
+        pending_amount = pending_bets["bet_amount"].sum() if not pending_bets.empty else 0
+    bankroll = config["total_deposited"] + settled_profit - pending_amount
+
+    # Display
+    st.sidebar.header("Bankroll")
+    st.sidebar.metric("Current Bankroll", "${:,.2f}".format(bankroll),
+                       delta="${:+,.2f}".format(settled_profit) if settled_profit != 0 else None)
+    st.sidebar.caption("Deposited: ${:,.0f} | P&L: ${:+,.2f}".format(
+        config["total_deposited"], settled_profit))
+    if pending_count > 0:
+        st.sidebar.caption("{} bets pending".format(pending_count))
+
+    # Deposit funds
+    add_funds = st.sidebar.number_input("Add Funds ($)", value=0, step=50, min_value=0)
+    if add_funds > 0 and st.sidebar.button("Deposit"):
+        config["total_deposited"] += add_funds
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+        st.rerun()
+
     kelly_fraction = st.sidebar.slider("Kelly Fraction", 0.1, 1.0, 0.25, 0.05)
 
     # Refresh button
@@ -572,7 +639,7 @@ def main():
                             bet_amt = round(bankroll * k_pct, 2)
                             st.write("Edge: {:+.1f}% {}".format(edge_home * 100, game["home_abbr"]))
                             if bet_amt > 0:
-                                st.write("${:.0f} ({:.1f}%)".format(bet_amt, k_pct * 100))
+                                st.write("${:.2f} ({:.1f}%)".format(bet_amt, k_pct * 100))
 
                                 existing = load_bets()
                                 already_bet = False
@@ -598,7 +665,7 @@ def main():
                             bet_amt = round(bankroll * k_pct, 2)
                             st.write("Edge: {:+.1f}% {}".format(edge_away * 100, game["away_abbr"]))
                             if bet_amt > 0:
-                                st.write("${:.0f} ({:.1f}%)".format(bet_amt, k_pct * 100))
+                                st.write("${:.2f} ({:.1f}%)".format(bet_amt, k_pct * 100))
 
                                 existing = load_bets()
                                 already_bet = False
@@ -746,6 +813,68 @@ def main():
     with tab_pnl:
         st.header("P&L Tracker")
 
+        # Manual bet entry
+        with st.expander("Add Bet Manually"):
+            st.caption("Log a bet you placed but didn't track in the dashboard.")
+            
+            manual_col1, manual_col2 = st.columns(2)
+            with manual_col1:
+                manual_date = st.date_input("Game Date", key="manual_date")
+                manual_date_str = manual_date.strftime("%Y%m%d")
+            with manual_col2:
+                manual_side = st.selectbox("Bet Side", ["home", "away"], key="manual_side")
+
+            # Fetch games for that date
+            manual_scoreboard = fetch_scoreboard(manual_date_str)
+            if manual_scoreboard:
+                manual_games = parse_scoreboard(manual_scoreboard)
+                game_options = {
+                    "{} @ {} ({})".format(g["away_abbr"], g["home_abbr"], g["status"]): g
+                    for g in manual_games
+                }
+                if game_options:
+                    selected_game_label = st.selectbox("Game", list(game_options.keys()), key="manual_game")
+                    selected_game = game_options[selected_game_label]
+
+                    manual_col3, manual_col4, manual_col5 = st.columns(3)
+                    with manual_col3:
+                        manual_amount = st.number_input("Bet Amount ($)", value=100, min_value=1, key="manual_amt")
+                    with manual_col4:
+                        manual_ml = st.number_input("Moneyline", value=-110, key="manual_ml")
+                    with manual_col5:
+                        ml_val = float(manual_ml)
+                        if ml_val < 0:
+                            manual_decimal = 1 + (100 / abs(ml_val))
+                        else:
+                            manual_decimal = 1 + (ml_val / 100)
+                        st.metric("Decimal Odds", "{:.3f}".format(manual_decimal))
+
+                    if st.button("Log Bet", key="manual_log", type="primary"):
+                        # Compute market prob from moneyline
+                        if ml_val < 0:
+                            market_prob = abs(ml_val) / (abs(ml_val) + 100)
+                        else:
+                            market_prob = 100 / (ml_val + 100)
+
+                        saved = save_bet(
+                            selected_game["game_id"],
+                            selected_game["date"],
+                            selected_game["home_team"],
+                            selected_game["away_team"],
+                            manual_side,
+                            manual_amount,
+                            0.0,  # no model prob for manual bets
+                            market_prob,
+                            manual_decimal,
+                        )
+                        if saved:
+                            st.success("Bet logged!")
+                            st.rerun()
+                        else:
+                            st.warning("Bet already exists for this game/side.")
+                else:
+                    st.warning("No games found for this date.")
+
         bets = settle_bets()
 
         if bets.empty:
@@ -755,11 +884,11 @@ def main():
             pending = bets[bets["profit"].isna()].copy()
 
             # Summary metrics
-            col1, col2, col3, col4, col5 = st.columns(5)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
 
             with col1:
                 total_profit = settled["profit"].sum() if not settled.empty else 0
-                current = bankroll + total_profit
+                current = bankroll
                 st.metric("Bankroll", "${:,.0f}".format(current),
                           delta="${:+,.0f}".format(total_profit))
 
@@ -780,6 +909,9 @@ def main():
             with col5:
                 st.metric("Pending", "{}".format(len(pending)))
 
+            with col6:
+                st.metric("P&L", "{:+,.2f}".format(total_profit))
+
             # Cumulative P&L chart
             if not settled.empty:
                 settled = settled.sort_values("date").reset_index(drop=True)
@@ -789,16 +921,23 @@ def main():
 
             # Pending bets
             if not pending.empty:
-                st.subheader("Pending Bets")
+                total_locked = pending["bet_amount"].sum()
+                st.subheader("Pending Bets — ${:,.2f} locked".format(total_locked))
                 display_pending = pending[["date", "home_team", "away_team",
                                            "bet_side", "bet_amount", "model_prob",
-                                           "market_prob"]].copy()
+                                           "market_prob", "decimal_odds"]].copy()
+                display_pending["potential_profit"] = display_pending.apply(
+                    lambda r: r["bet_amount"] * (r["decimal_odds"] - 1), axis=1)
                 display_pending["bet_amount"] = display_pending["bet_amount"].apply(
-                    lambda x: "${:.0f}".format(x))
+                    lambda x: "${:.2f}".format(x))
+                display_pending["potential_profit"] = display_pending["potential_profit"].apply(
+                    lambda x: "+${:.2f}".format(x))
                 display_pending["model_prob"] = display_pending["model_prob"].apply(
                     lambda x: "{:.1%}".format(x))
                 display_pending["market_prob"] = display_pending["market_prob"].apply(
                     lambda x: "{:.1%}".format(x))
+                display_pending = display_pending.drop(columns=["decimal_odds"])
+                display_pending = display_pending.sort_values("date", ascending=False)
                 st.dataframe(display_pending, use_container_width=True, hide_index=True)
 
             # Settled bets
