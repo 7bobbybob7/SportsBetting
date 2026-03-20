@@ -129,10 +129,12 @@ def pull_new_games(start_date, end_date=None):
     if isinstance(start_date, str):
         start_date = datetime.strptime(start_date, "%Y%m%d")
     if end_date is None:
-        end_date = datetime.now()
+        end_date = pd.Timestamp.now().tz_localize(None)
     elif isinstance(end_date, str):
         end_date = datetime.strptime(end_date, "%Y%m%d")
 
+    if hasattr(start_date, 'tzinfo') and start_date.tzinfo is not None:
+        start_date = start_date.replace(tzinfo=None)
     total_days = (end_date - start_date).days + 1
     print("Pulling games from {} to {} ({} days)".format(
         start_date.strftime("%Y-%m-%d"),

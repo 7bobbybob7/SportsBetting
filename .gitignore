@@ -2,12 +2,14 @@
 data/raw/
 data/processed/
 data/odds/
+data/bets_log.csv
 *.csv
 *.parquet
 
 # Models
 models/*.pkl
 models/*.joblib
+models/*.json
 
 # Python
 __pycache__/
@@ -27,3 +29,17 @@ venv/
 
 # OS
 .DS_Store
+
+# Logs
+logs/
+
+# Kaggle
+kaggle_*.py
+kaggle_*.csv
+kaggle_*.zip
+womens_*.py
+womens_*.csv
+plots/
+
+# Other
+calibration_backtest.py
